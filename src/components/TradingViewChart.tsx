@@ -5,14 +5,10 @@ import {
   CandlestickSeries,
   ColorType,
   createChart,
-  createSeriesMarkers,
   IChartApi,
   IPriceLine,
   ISeriesApi,
-  ISeriesMarkersPluginApi,
   LineStyle,
-  SeriesMarker,
-  Time,
   UTCTimestamp,
 } from 'lightweight-charts';
 import { useReplayStore } from '../store/useReplayStore';
@@ -22,15 +18,24 @@ type DrawingTool = 'cursor' | 'vertical' | 'horizontal' | 'trendline' | 'rectang
 type DrawingPoint = { x: number; y: number };
 type Drawing = { id: number; tool: Exclude<DrawingTool, 'cursor'>; from: DrawingPoint; to: DrawingPoint; color: string };
 type SessionRange = { key: string; start: number; end: number };
-type ChartDisplaySettings = { upColor: string; downColor: string; showTradeHistory: boolean; showGrid: boolean };
+type ChartDisplaySettings = { upColor: string; downColor: string; showGrid: boolean };
 
 const CHART_SETTINGS_KEY = 'mt5-chart-display-settings-v1';
+const REPLAY_CHART_WINDOW_SIZE = 50_000;
+const REPLAY_CHART_WINDOW_SHIFT = 2_000;
 const DEFAULT_CHART_SETTINGS: ChartDisplaySettings = {
   upColor: '#22c55e',
   downColor: '#ef4444',
-  showTradeHistory: true,
   showGrid: true,
 };
+
+function tradeRiskReward(entryPrice: number, stopLoss: number | null, takeProfit: number | null) {
+  if (stopLoss === null || takeProfit === null) return null;
+  const risk = Math.abs(entryPrice - stopLoss);
+  const reward = Math.abs(takeProfit - entryPrice);
+  if (!(risk > 0) || !(reward > 0) || !Number.isFinite(risk) || !Number.isFinite(reward)) return null;
+  return `1 : ${(reward / risk).toFixed(2)}`;
+}
 
 function zonedDateParts(timestampSec: number, timeZone: string) {
   const parts = new Intl.DateTimeFormat('en-US', {
@@ -86,15 +91,15 @@ function sessionRangesForWindow(startSec: number, endSec: number, mode: 'automat
   return ranges;
 }
 
-function candleIndexAtOrAfter(candles: { time: number }[], timeSec: number) {
+function candleIndexAtOrAfter(candles: { time: number }[], timeSec: number, limit = candles.length) {
   let low = 0;
-  let high = candles.length;
+  let high = limit;
   while (low < high) {
     const middle = (low + high) >>> 1;
     if (candles[middle].time < timeSec) low = middle + 1;
     else high = middle;
   }
-  return Math.max(0, Math.min(candles.length - 1, low));
+  return Math.max(0, Math.min(limit - 1, low));
 }
 
 function candleLowerBound(candles: { time: number }[], timeSec: number) {
@@ -103,6 +108,17 @@ function candleLowerBound(candles: { time: number }[], timeSec: number) {
   while (low < high) {
     const middle = (low + high) >>> 1;
     if (candles[middle].time < timeSec) low = middle + 1;
+    else high = middle;
+  }
+  return low;
+}
+
+function candleCountThrough(candles: { time: number }[], timeSec: number) {
+  let low = 0;
+  let high = candles.length;
+  while (low < high) {
+    const middle = (low + high) >>> 1;
+    if (candles[middle].time <= timeSec) low = middle + 1;
     else high = middle;
   }
   return low;
@@ -132,14 +148,13 @@ export default function TradingViewChart() {
   const chartContainerRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<IChartApi | null>(null);
   const seriesRef = useRef<ISeriesApi<'Candlestick'> | null>(null);
-  const tradeMarkersRef = useRef<ISeriesMarkersPluginApi<Time> | null>(null);
   const priceLinesRef = useRef(new Map<string, IPriceLine>());
   const draggedLevelRef = useRef<{ tradeId: number; level: 'stopLoss' | 'takeProfit' } | null>(null);
   const replayDragRef = useRef(false);
   const replayAutoScrollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const replayPointerXRef = useRef<number | null>(null);
   const replayAutoScrollDirectionRef = useRef<-1 | 0 | 1>(0);
-  const renderedDataRef = useRef<{ timeframe: string; visibleCount: number; currentTimeSec: number | null; isSelectingReplay: boolean } | null>(null);
+  const renderedDataRef = useRef<{ timeframe: string; visibleCount: number; startIndex: number; currentTimeSec: number | null; isSelectingReplay: boolean } | null>(null);
   const drawingIdRef = useRef(1);
 
   const [tool, setTool] = useState<DrawingTool>('cursor');
@@ -180,6 +195,7 @@ export default function TradingViewChart() {
       timeScale: {
         timeVisible: true,
         secondsVisible: false,
+        shiftVisibleRangeOnNewBar: true,
       },
     });
 
@@ -193,7 +209,6 @@ export default function TradingViewChart() {
 
     chartRef.current = chart;
     seriesRef.current = candlestickSeries;
-    tradeMarkersRef.current = createSeriesMarkers(candlestickSeries, []);
     const handleVisibleRangeChange = (range: { from: number; to: number } | null) => {
       setVisibleLogicalRange(range);
     };
@@ -228,7 +243,6 @@ export default function TradingViewChart() {
       chart.remove();
       chartRef.current = null;
       seriesRef.current = null;
-      tradeMarkersRef.current = null;
       priceLines.clear();
     };
   }, []);
@@ -242,7 +256,6 @@ export default function TradingViewChart() {
           setChartSettings({
             upColor: typeof parsed.upColor === 'string' && /^#[0-9a-f]{6}$/i.test(parsed.upColor) ? parsed.upColor : DEFAULT_CHART_SETTINGS.upColor,
             downColor: typeof parsed.downColor === 'string' && /^#[0-9a-f]{6}$/i.test(parsed.downColor) ? parsed.downColor : DEFAULT_CHART_SETTINGS.downColor,
-            showTradeHistory: typeof parsed.showTradeHistory === 'boolean' ? parsed.showTradeHistory : DEFAULT_CHART_SETTINGS.showTradeHistory,
             showGrid: typeof parsed.showGrid === 'boolean' ? parsed.showGrid : DEFAULT_CHART_SETTINGS.showGrid,
           });
         }
@@ -283,49 +296,76 @@ export default function TradingViewChart() {
     const fullDataset = datasets[activeTimeframe];
     if (!fullDataset?.length) {
       series.setData([]);
-      renderedDataRef.current = { timeframe: activeTimeframe, visibleCount: 0, currentTimeSec, isSelectingReplay };
+      renderedDataRef.current = { timeframe: activeTimeframe, visibleCount: 0, startIndex: 0, currentTimeSec, isSelectingReplay };
       return;
     }
 
-    const visibleCandles = isSelectingReplay || currentTimeSec === null
-      ? fullDataset
-      : fullDataset.filter((candle) => candle.time <= currentTimeSec);
+    const visibleCount = isSelectingReplay || currentTimeSec === null
+      ? fullDataset.length
+      : candleCountThrough(fullDataset, currentTimeSec);
+    const replayWindowOffset = Math.max(0, visibleCount - REPLAY_CHART_WINDOW_SIZE);
+    const startIndex = currentTimeSec !== null && !isSelectingReplay
+      ? Math.floor(replayWindowOffset / REPLAY_CHART_WINDOW_SHIFT) * REPLAY_CHART_WINDOW_SHIFT
+      : 0;
+    const chartDataCount = visibleCount - startIndex;
 
     const previous = renderedDataRef.current;
     const previousRange = chart.timeScale().getVisibleLogicalRange();
-    series.setData(visibleCandles.map((candle) => ({
-      time: candle.time as UTCTimestamp,
-      open: candle.open,
-      high: candle.high,
-      low: candle.low,
-      close: candle.close,
-    })));
-    if (visibleCandles.length > 0) {
+    const canAppendCandles = previous
+      && previous.timeframe === activeTimeframe
+      && previous.startIndex === startIndex
+      && !previous.isSelectingReplay
+      && !isSelectingReplay
+      && previous.currentTimeSec !== null
+      && currentTimeSec !== null
+      && currentTimeSec > previous.currentTimeSec
+      && visibleCount > previous.visibleCount;
+
+    if (canAppendCandles && previous) {
+      for (let index = previous.visibleCount; index < visibleCount; index += 1) {
+        const candle = fullDataset[index];
+        series.update({
+          time: candle.time as UTCTimestamp,
+          open: candle.open,
+          high: candle.high,
+          low: candle.low,
+          close: candle.close,
+        });
+      }
+    } else {
+      series.setData(fullDataset.slice(startIndex, visibleCount).map((candle) => ({
+        time: candle.time as UTCTimestamp,
+        open: candle.open,
+        high: candle.high,
+        low: candle.low,
+        close: candle.close,
+      })));
+    }
+
+    if (visibleCount > 0) {
       const isNewTimeframe = !previous || previous.timeframe !== activeTimeframe;
-      const isInitialDataLoad = previous?.visibleCount !== visibleCandles.length
+      const isInitialDataLoad = previous?.visibleCount !== visibleCount
         && previous?.currentTimeSec === null && currentTimeSec === null;
       const isStartingReplay = previous?.isSelectingReplay === true && !isSelectingReplay;
       const rangeWidth = previousRange ? previousRange.to - previousRange.from : 125;
 
       if (isNewTimeframe || isInitialDataLoad || !previousRange) {
         chart.timeScale().setVisibleLogicalRange({
-          from: Math.max(0, visibleCandles.length - 120),
-          to: visibleCandles.length + 5,
+          from: Math.max(0, chartDataCount - 120),
+          to: chartDataCount + 5,
         });
       } else if (isStartingReplay) {
-        const to = visibleCandles.length + 5;
+        const to = chartDataCount + 5;
         chart.timeScale().setVisibleLogicalRange({ from: Math.max(0, to - rangeWidth), to });
-      } else if (previous.currentTimeSec !== currentTimeSec && !isSelectingReplay) {
-        const addedCandles = visibleCandles.length - previous.visibleCount;
+      } else if (!canAppendCandles) {
+        const startShift = (previous?.startIndex ?? 0) - startIndex;
         chart.timeScale().setVisibleLogicalRange({
-          from: Math.max(0, previousRange.from + addedCandles),
-          to: Math.max(rangeWidth, previousRange.to + addedCandles),
+          from: Math.max(0, previousRange.from + startShift),
+          to: Math.max(1, previousRange.to + startShift),
         });
-      } else {
-        chart.timeScale().setVisibleLogicalRange(previousRange);
       }
     }
-    renderedDataRef.current = { timeframe: activeTimeframe, visibleCount: visibleCandles.length, currentTimeSec, isSelectingReplay };
+    renderedDataRef.current = { timeframe: activeTimeframe, visibleCount, startIndex, currentTimeSec, isSelectingReplay };
   }, [activeTimeframe, datasets, currentTimeSec, isSelectingReplay]);
 
   useEffect(() => {
@@ -337,6 +377,7 @@ export default function TradingViewChart() {
     if (currentTimeSec !== null || isSelectingReplay) {
       for (const trade of trades) {
         if (trade.status !== 'open' || (trade.symbol ?? 'DJIUSD').toLowerCase() !== activeSymbol.toLowerCase()) continue;
+        const riskReward = tradeRiskReward(trade.entryPrice, trade.stopLoss, trade.takeProfit);
         for (const level of ['entryPrice', 'stopLoss', 'takeProfit'] as const) {
           const price = trade[level];
           const key = `${trade.id}:${level}`;
@@ -349,7 +390,9 @@ export default function TradingViewChart() {
             lineWidth: 2 as const,
             lineStyle: level === 'entryPrice' ? LineStyle.Dotted : LineStyle.Dashed,
             axisLabelVisible: true,
-            title: `${level === 'entryPrice' ? 'ENTRY' : level === 'stopLoss' ? 'SL' : 'TP'} #${trade.id}`,
+            title: level === 'takeProfit'
+              ? `TP #${trade.id}${riskReward ? ` · R:R ${riskReward}` : ''}`
+              : `${level === 'entryPrice' ? 'ENTRY' : 'SL'} #${trade.id}`,
           };
           const existingLine = priceLinesRef.current.get(key);
           if (existingLine) existingLine.applyOptions(options);
@@ -467,7 +510,8 @@ export default function TradingViewChart() {
     if (!chart || !candles.length || bounds.width === 0) return null;
     const logicalIndex = chart.timeScale().coordinateToLogical(event.clientX - bounds.left);
     if (logicalIndex === null) return null;
-    const candleIndex = Math.max(0, Math.min(candles.length - 1, Math.round(logicalIndex)));
+    const chartStartIndex = currentTimeSec !== null && !isSelectingReplay ? renderedDataRef.current?.startIndex ?? 0 : 0;
+    const candleIndex = Math.max(0, Math.min(candles.length - 1, chartStartIndex + Math.round(logicalIndex)));
     return candles[candleIndex].time;
   };
 
@@ -622,84 +666,55 @@ export default function TradingViewChart() {
     });
   };
 
-  const visibleCandles = useMemo(() => {
-    const candles = datasets[activeTimeframe] ?? [];
-    return isSelectingReplay || currentTimeSec === null
-      ? candles
-      : candles.filter((candle) => candle.time <= currentTimeSec);
-  }, [activeTimeframe, datasets, currentTimeSec, isSelectingReplay]);
-
-  const tradeHistoryMarkers = useMemo<SeriesMarker<Time>[]>(() => {
-    if (!chartSettings.showTradeHistory || visibleCandles.length === 0) return [];
-    const firstTime = visibleCandles[0].time;
-    const lastTime = visibleCandles[visibleCandles.length - 1].time;
-    const nearestVisibleTime = (timestamp: number) => {
-      const index = candleLowerBound(visibleCandles, timestamp);
-      if (index <= 0) return visibleCandles[0].time;
-      if (index >= visibleCandles.length) return visibleCandles[visibleCandles.length - 1].time;
-      const before = visibleCandles[index - 1];
-      const after = visibleCandles[index];
-      return timestamp - before.time <= after.time - timestamp ? before.time : after.time;
-    };
-
-    return trades.flatMap((trade) => {
-      if ((trade.symbol ?? 'DJIUSD').toLowerCase() !== activeSymbol.toLowerCase()
-        || trade.status !== 'closed' || trade.exitTime === null || trade.exitPrice === null
-        || trade.entryTime < firstTime || trade.entryTime > lastTime || trade.exitTime < firstTime || trade.exitTime > lastTime) return [];
-      const entryColor = trade.side === 'buy' ? chartSettings.upColor : chartSettings.downColor;
-      const exitColor = (trade.realizedProfit ?? 0) >= 0 ? '#34d399' : '#fb7185';
-      const entryMarker: SeriesMarker<Time> = {
-        id: `trade-${trade.id}-entry`,
-        time: nearestVisibleTime(trade.entryTime) as UTCTimestamp,
-        position: trade.side === 'buy' ? 'belowBar' : 'aboveBar',
-        shape: trade.side === 'buy' ? 'arrowUp' : 'arrowDown',
-        color: entryColor,
-        text: `${trade.side === 'buy' ? 'B' : 'S'}${trade.id}`,
-        size: 1.2,
-      };
-      const exitMarker: SeriesMarker<Time> = {
-        id: `trade-${trade.id}-exit`,
-        time: nearestVisibleTime(trade.exitTime) as UTCTimestamp,
-        position: trade.side === 'buy' ? 'aboveBar' : 'belowBar',
-        shape: 'circle',
-        color: exitColor,
-        text: `${trade.closeReason === 'stop-loss' ? 'SL' : trade.closeReason === 'take-profit' ? 'TP' : 'X'}${trade.id}`,
-        size: 1.1,
-      };
-      return [entryMarker, exitMarker];
-    }).sort((a, b) => Number(a.time) - Number(b.time));
-  }, [activeSymbol, chartSettings.showTradeHistory, chartSettings.upColor, chartSettings.downColor, visibleCandles, trades]);
-
-  useEffect(() => {
-    tradeMarkersRef.current?.setMarkers(tradeHistoryMarkers);
-  }, [tradeHistoryMarkers]);
+  const chartCandles = datasets[activeTimeframe];
+  const visibleCandleCount = isSelectingReplay || currentTimeSec === null
+    ? chartCandles.length
+    : candleCountThrough(chartCandles, currentTimeSec);
+  const chartStartIndex = currentTimeSec !== null && !isSelectingReplay
+    ? Math.floor(Math.max(0, visibleCandleCount - REPLAY_CHART_WINDOW_SIZE) / REPLAY_CHART_WINDOW_SHIFT) * REPLAY_CHART_WINDOW_SHIFT
+    : 0;
+  const chartVisibleCount = Math.max(0, visibleCandleCount - chartStartIndex);
 
   const latestCompletedSessionLevels = useMemo(() => {
-    if (!showNewYorkSession || visibleCandles.length === 0) return null;
-    const sessions = sessionRangesForWindow(
-      visibleCandles[0].time,
-      visibleCandles[visibleCandles.length - 1].time,
-      sessionTimeMode,
-      manualSessionStart,
-      manualSessionEnd,
-      brokerUtcOffsetHours,
-    );
-    const session = [...sessions].reverse().find((item) => item.end <= visibleCandles[visibleCandles.length - 1].time);
-    if (!session) return null;
+    if (!showNewYorkSession || visibleCandleCount === 0) return null;
+    const lastVisibleTime = chartCandles[visibleCandleCount - 1].time;
+    const firstDataTime = chartCandles[0].time;
+    let lookbackSeconds = 3 * 86400;
 
-    const startIndex = candleLowerBound(visibleCandles, session.start);
-    const endIndex = candleLowerBound(visibleCandles, session.end) - 1;
-    if (startIndex >= visibleCandles.length || endIndex < startIndex) return null;
-    const startCandle = visibleCandles[startIndex];
-    const endCandle = visibleCandles[endIndex];
-    return {
-      key: session.key,
-      startIndex,
-      startPrice: startCandle.open,
-      endIndex,
-      endPrice: endCandle.close,
-    };
-  }, [showNewYorkSession, visibleCandles, sessionTimeMode, manualSessionStart, manualSessionEnd, brokerUtcOffsetHours]);
+    // Replay advances one candle at a time. Searching from the start of a
+    // multi-year CSV on every M1 update makes the session overlay slow down
+    // playback, so start near the latest candle and expand only for data gaps.
+    while (true) {
+      const windowStart = Math.max(firstDataTime, lastVisibleTime - lookbackSeconds);
+      const sessions = sessionRangesForWindow(
+        windowStart,
+        lastVisibleTime,
+        sessionTimeMode,
+        manualSessionStart,
+        manualSessionEnd,
+        brokerUtcOffsetHours,
+      );
+      const session = [...sessions].reverse().find((item) => item.end <= lastVisibleTime);
+      if (session) {
+        const startIndex = candleLowerBound(chartCandles, session.start);
+        const endIndex = candleLowerBound(chartCandles, session.end) - 1;
+        if (startIndex < visibleCandleCount && endIndex >= startIndex) {
+          const startCandle = chartCandles[startIndex];
+          const endCandle = chartCandles[endIndex];
+          return {
+            key: session.key,
+            startIndex,
+            startPrice: startCandle.open,
+            endIndex,
+            endPrice: endCandle.close,
+          };
+        }
+      }
+
+      if (windowStart <= firstDataTime) return null;
+      lookbackSeconds *= 2;
+    }
+  }, [showNewYorkSession, chartCandles, visibleCandleCount, sessionTimeMode, manualSessionStart, manualSessionEnd, brokerUtcOffsetHours]);
 
   useEffect(() => {
     const frame = requestAnimationFrame(() => {
@@ -709,7 +724,7 @@ export default function TradingViewChart() {
         setSessionPriceLines([]);
         return;
       }
-      const xForIndex = (index: number) => ((index - visibleLogicalRange.from) / (visibleLogicalRange.to - visibleLogicalRange.from)) * plotSize.width;
+      const xForIndex = (index: number) => ((index - chartStartIndex - visibleLogicalRange.from) / (visibleLogicalRange.to - visibleLogicalRange.from)) * plotSize.width;
       const startY = series.priceToCoordinate(latestCompletedSessionLevels.startPrice);
       const endY = series.priceToCoordinate(latestCompletedSessionLevels.endPrice);
       if (startY === null || endY === null) {
@@ -725,12 +740,12 @@ export default function TradingViewChart() {
       }]);
     });
     return () => cancelAnimationFrame(frame);
-  }, [showNewYorkSession, latestCompletedSessionLevels, visibleLogicalRange, plotSize]);
-  const replayMarkerIndex = replayStartTimeSec === null
-    ? -1
-    : visibleCandles.findIndex((candle) => candle.time === replayStartTimeSec);
-  const fallbackReplayFrom = Math.max(0, visibleCandles.length - 120);
-  const fallbackReplayTo = visibleCandles.length + 5;
+  }, [showNewYorkSession, latestCompletedSessionLevels, visibleLogicalRange, plotSize, chartStartIndex]);
+  const replayMarkerCandidate = replayStartTimeSec === null ? -1 : candleLowerBound(chartCandles, replayStartTimeSec);
+  const replayMarkerIndex = isSelectingReplay && replayMarkerCandidate < chartCandles.length
+    && chartCandles[replayMarkerCandidate]?.time === replayStartTimeSec ? replayMarkerCandidate : -1;
+  const fallbackReplayFrom = Math.max(0, chartVisibleCount - 120);
+  const fallbackReplayTo = chartVisibleCount + 5;
   const replayFrom = visibleLogicalRange?.from ?? fallbackReplayFrom;
   const replayTo = visibleLogicalRange?.to ?? fallbackReplayTo;
   const replayMarkerX = replayMarkerIndex < 0 || replayTo === replayFrom
@@ -739,24 +754,24 @@ export default function TradingViewChart() {
 
   const sessionRangeFrom = visibleLogicalRange?.from ?? fallbackReplayFrom;
   const sessionRangeTo = visibleLogicalRange?.to ?? fallbackReplayTo;
-  const sessionFirstIndex = Math.max(0, Math.min(visibleCandles.length - 1, Math.floor(sessionRangeFrom)));
-  const sessionLastIndex = Math.max(0, Math.min(visibleCandles.length - 1, Math.ceil(sessionRangeTo)));
-  const visibleSessions = showNewYorkSession && visibleCandles.length > 0
+  const sessionFirstIndex = Math.max(chartStartIndex, Math.min(visibleCandleCount - 1, chartStartIndex + Math.floor(sessionRangeFrom)));
+  const sessionLastIndex = Math.max(chartStartIndex, Math.min(visibleCandleCount - 1, chartStartIndex + Math.ceil(sessionRangeTo)));
+  const visibleSessions = showNewYorkSession && visibleCandleCount > 0
     ? sessionRangesForWindow(
-      visibleCandles[sessionFirstIndex].time,
-      visibleCandles[sessionLastIndex].time,
+      chartCandles[sessionFirstIndex].time,
+      chartCandles[sessionLastIndex].time,
       sessionTimeMode,
       manualSessionStart,
       manualSessionEnd,
       brokerUtcOffsetHours,
     ).map((session) => {
-      const startIndex = candleIndexAtOrAfter(visibleCandles, session.start);
-      const endIndex = candleIndexAtOrAfter(visibleCandles, session.end);
+      const startIndex = candleIndexAtOrAfter(chartCandles, session.start, visibleCandleCount);
+      const endIndex = candleIndexAtOrAfter(chartCandles, session.end, visibleCandleCount);
       const span = sessionRangeTo - sessionRangeFrom;
       return {
         ...session,
-        startX: span > 0 ? ((startIndex - sessionRangeFrom) / span) * plotSize.width : 0,
-        endX: span > 0 ? ((endIndex - sessionRangeFrom) / span) * plotSize.width : 0,
+        startX: span > 0 ? ((startIndex - chartStartIndex - sessionRangeFrom) / span) * plotSize.width : 0,
+        endX: span > 0 ? ((endIndex - chartStartIndex - sessionRangeFrom) / span) * plotSize.width : 0,
       };
     })
     : [];
@@ -921,11 +936,6 @@ export default function TradingViewChart() {
             <input aria-label="Bearish candle color" type="color" value={chartSettings.downColor}
               onChange={(event) => setChartSettings((settings) => ({ ...settings, downColor: event.target.value }))}
               className="h-7 w-10 cursor-pointer rounded border border-slate-600 bg-transparent p-0.5" />
-          </label>
-          <label className="mb-2 flex cursor-pointer items-center justify-between gap-3 text-xs text-slate-300">
-            <span>Trade History</span>
-            <input type="checkbox" checked={chartSettings.showTradeHistory}
-              onChange={(event) => setChartSettings((settings) => ({ ...settings, showTradeHistory: event.target.checked }))} />
           </label>
           <label className="flex cursor-pointer items-center justify-between gap-3 text-xs text-slate-300">
             <span>نمایش Grid</span>

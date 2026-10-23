@@ -61,7 +61,7 @@ function uniqueArchives(archives: ReplayArchive[]) {
       currentTimeSec: archive.currentTimeSec,
       replayStartTimeSec: archive.replayStartTimeSec,
       isSelectingReplay: archive.isSelectingReplay,
-      speedMs: archive.speedMs,
+      speedMs: archive.speedMs === 0 ? 1000 : archive.speedMs,
       dataSignature: archive.dataSignature,
       trading: archive.trading,
     });
@@ -163,6 +163,8 @@ export default function ReplayArchiveManager() {
   const importInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
+    let saveTimer: number | null = null;
+    let lastSaveAt = 0;
     const loadArchivesTimer = window.setTimeout(() => {
       const stored = readArchives();
       const unique = uniqueArchives(stored);
@@ -170,7 +172,7 @@ export default function ReplayArchiveManager() {
       setArchives(unique);
     }, 0);
 
-    const saveCurrentState = () => {
+    const persistCurrentState = () => {
       const replay = useReplayStore.getState();
       const inReplay = replay.isSelectingReplay || replay.currentTimeSec !== null;
       if (!inReplay) {
@@ -190,6 +192,7 @@ export default function ReplayArchiveManager() {
       const next = [updated, ...stored.filter((archive) => archive.id !== id)].sort((a, b) => b.updatedAt - a.updatedAt);
       try {
         writeArchives(next);
+        lastSaveAt = now;
         activeArchiveId.current = id;
         if (now - lastListRefresh.current > 1000) {
           lastListRefresh.current = now;
@@ -201,11 +204,37 @@ export default function ReplayArchiveManager() {
       }
     };
 
+    const saveCurrentState = () => {
+      const replay = useReplayStore.getState();
+      if (!replay.isSelectingReplay && replay.currentTimeSec === null) {
+        if (saveTimer !== null) window.clearTimeout(saveTimer);
+        saveTimer = null;
+        activeArchiveId.current = null;
+        suppressAutoArchive.current = false;
+        return;
+      }
+      if (suppressAutoArchive.current || saveTimer !== null) return;
+      const delay = Math.max(0, 1000 - (Date.now() - lastSaveAt));
+      saveTimer = window.setTimeout(() => {
+        saveTimer = null;
+        persistCurrentState();
+      }, delay);
+    };
+
+    const flushCurrentState = () => {
+      if (saveTimer !== null) window.clearTimeout(saveTimer);
+      saveTimer = null;
+      persistCurrentState();
+    };
+
     const unsubscribeReplay = useReplayStore.subscribe(saveCurrentState);
     const unsubscribeTrading = useTradingStore.subscribe(saveCurrentState);
     saveCurrentState();
+    window.addEventListener('pagehide', flushCurrentState);
     return () => {
       window.clearTimeout(loadArchivesTimer);
+      if (saveTimer !== null) window.clearTimeout(saveTimer);
+      window.removeEventListener('pagehide', flushCurrentState);
       unsubscribeReplay();
       unsubscribeTrading();
     };
@@ -238,7 +267,13 @@ export default function ReplayArchiveManager() {
       isPlaying: false,
       speedMs: archive.speedMs,
     });
-    useTradingStore.setState(archive.trading);
+    const closedTradesBySymbol = archive.trading.trades.reduce<Record<string, Trade[]>>((grouped, trade) => {
+      if (trade.status !== 'closed') return grouped;
+      const symbol = (trade.symbol ?? 'DJIUSD').toLowerCase();
+      grouped[symbol] = [...(grouped[symbol] ?? []), trade];
+      return grouped;
+    }, {});
+    useTradingStore.setState({ ...archive.trading, closedTradesBySymbol });
     setNotice('بک‌تست از نقطهٔ ذخیره‌شده ادامه پیدا کرد.');
     setIsOpen(false);
   };

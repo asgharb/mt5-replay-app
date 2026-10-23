@@ -9,6 +9,7 @@ import type { PendingOrderType } from '../types/trading';
 
 const inputClass = 'w-full rounded border border-slate-700 bg-slate-950 px-2 py-1.5 text-left text-sm text-slate-100 outline-none focus:border-sky-500';
 const currencyFormatter = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 2 });
+const EMPTY_CLOSED_TRADES: Trade[] = [];
 
 function localDateKey(timestampSec: number) {
   const date = new Date(timestampSec * 1000);
@@ -50,6 +51,7 @@ function formatPrice(price: number | null) {
 export default function SimulatorPanel() {
   const { activeSymbol, activeTimeframe, currentTimeSec, datasets } = useReplayStore();
   const account = useTradingStore();
+  const closedTrades = useTradingStore((state) => state.closedTradesBySymbol[activeSymbol.toLowerCase()] ?? EMPTY_CLOSED_TRADES);
   const capitalInputRef = useRef<HTMLInputElement>(null);
   const [lotsDraft, setLotsDraft] = useState(String(account.defaultLots));
   const [stopDraft, setStopDraft] = useState(String(account.defaultStopLossPoints));
@@ -70,12 +72,10 @@ export default function SimulatorPanel() {
     return index < 0 ? null : candles[index];
   }, [activeTimeframe, currentTimeSec, datasets]);
 
-  const symbolTrades = account.trades.filter((trade) => (trade.symbol ?? 'DJIUSD').toLowerCase() === activeSymbol.toLowerCase());
-  const openTrades = symbolTrades.filter((trade) => trade.status === 'open');
-  const closedTrades = symbolTrades.filter((trade) => trade.status === 'closed').slice()
-    .sort((a, b) => (b.exitTime ?? b.entryTime) - (a.exitTime ?? a.entryTime));
-  const symbolPendingOrders = account.pendingOrders.filter((order) => (order.symbol ?? 'DJIUSD').toLowerCase() === activeSymbol.toLowerCase());
-  const filteredClosedTrades = (() => {
+  const symbolTrades = useMemo(() => account.trades.filter((trade) => (trade.symbol ?? 'DJIUSD').toLowerCase() === activeSymbol.toLowerCase()), [account.trades, activeSymbol]);
+  const openTrades = useMemo(() => symbolTrades.filter((trade) => trade.status === 'open'), [symbolTrades]);
+  const symbolPendingOrders = useMemo(() => account.pendingOrders.filter((order) => (order.symbol ?? 'DJIUSD').toLowerCase() === activeSymbol.toLowerCase()), [account.pendingOrders, activeSymbol]);
+  const filteredClosedTrades = useMemo(() => {
     const query = historyQuery.trim().toLowerCase();
     return closedTrades.filter((trade) => {
       const profit = trade.realizedProfit ?? 0;
@@ -92,9 +92,9 @@ export default function SimulatorPanel() {
       const searchable = `${trade.id} ${trade.side} ${trade.side === 'buy' ? 'خرید buy' : 'فروش sell'} ${closeReason} ${trade.symbol ?? activeSymbol}`.toLowerCase();
       return sideMatches && resultMatches && dateMatches && (!query || searchable.includes(query));
     });
-  })();
+  }, [closedTrades, historyQuery, historySide, historyResult, historyFrom, historyTo, activeSymbol]);
 
-  const performance = (() => {
+  const performance = useMemo(() => {
     const chronologicalTrades = closedTrades.slice().sort((a, b) => (a.exitTime ?? a.entryTime) - (b.exitTime ?? b.entryTime));
     let netProfit = 0;
     let grossProfit = 0;
@@ -148,9 +148,9 @@ export default function SimulatorPanel() {
       firstTradeTime: chronologicalTrades[0]?.exitTime ?? null,
       lastTradeTime: chronologicalTrades[chronologicalTrades.length - 1]?.exitTime ?? null,
     };
-  })();
+  }, [closedTrades, account.initialCapital]);
 
-  const equityPlot = (() => {
+  const equityPlot = useMemo(() => {
     const curve = performance.equityCurve;
     if (curve.length < 2) return null;
     const sampled = curve.length > 240
@@ -163,7 +163,24 @@ export default function SimulatorPanel() {
     const high = maximum + padding;
     const points = sampled.map((value, index) => `${(index / (sampled.length - 1)) * 1000},${140 - ((value - low) / (high - low)) * 128}`).join(' ');
     return { points };
-  })();
+  }, [performance.equityCurve]);
+  const closedTradeHistoryContent = useMemo(() => {
+    if (closedTrades.length === 0) return <p className="p-3 text-xs text-slate-500">هنوز معامله‌ای بسته نشده است.</p>;
+    if (filteredClosedTrades.length === 0) return <p className="p-3 text-xs text-slate-500">معامله‌ای با این جست‌وجو و فیلترها پیدا نشد.</p>;
+    return filteredClosedTrades.map((trade) => (
+      <div key={trade.id} className="grid grid-cols-2 items-center gap-2 border-b border-slate-800 px-3 py-2 text-xs last:border-0 sm:grid-cols-[minmax(0,1.3fr)_minmax(100px,0.8fr)_auto_auto]">
+        <div>
+          <div className={`font-semibold ${trade.side === 'buy' ? 'text-emerald-400' : 'text-rose-400'}`}>
+            {trade.side === 'buy' ? 'خرید' : 'فروش'} #{trade.id} · {trade.closeReason === 'stop-loss' ? 'حدضرر' : trade.closeReason === 'take-profit' ? 'حدسود' : 'بستن دستی'}
+          </div>
+          <time className="mt-0.5 block text-[10px] text-slate-500">{formatTradeDate(trade.exitTime ?? trade.entryTime)}</time>
+        </div>
+        <span className="font-mono text-slate-300">{formatPrice(trade.entryPrice)} ← {formatPrice(trade.exitPrice)}</span>
+        <span className="font-mono text-sky-300">R:R {tradeRiskReward(trade)}</span>
+        <strong className={`text-left font-mono ${(trade.realizedProfit ?? 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>{currencyFormatter.format(trade.realizedProfit ?? 0)}</strong>
+      </div>
+    ));
+  }, [closedTrades.length, filteredClosedTrades]);
   const spread = candle ? Math.max(0, candle.spread) : 0;
   const floating = candle
     ? openTrades.reduce((total, trade) => total + floatingProfit(trade, candle.close, spread), 0)
@@ -445,21 +462,7 @@ export default function SimulatorPanel() {
               <input aria-label="تا تاریخ" className={inputClass} type="date" value={historyTo} onChange={(event) => setHistoryTo(event.target.value)} />
             </div>
             <div className="max-h-72 overflow-auto rounded border border-slate-800">
-              {closedTrades.length === 0 ? <p className="p-3 text-xs text-slate-500">هنوز معامله‌ای بسته نشده است.</p>
-                : filteredClosedTrades.length === 0 ? <p className="p-3 text-xs text-slate-500">معامله‌ای با این جست‌وجو و فیلترها پیدا نشد.</p>
-                  : filteredClosedTrades.map((trade) => (
-                    <div key={trade.id} className="grid grid-cols-2 items-center gap-2 border-b border-slate-800 px-3 py-2 text-xs last:border-0 sm:grid-cols-[minmax(0,1.3fr)_minmax(100px,0.8fr)_auto_auto]">
-                      <div>
-                        <div className={`font-semibold ${trade.side === 'buy' ? 'text-emerald-400' : 'text-rose-400'}`}>
-                          {trade.side === 'buy' ? 'خرید' : 'فروش'} #{trade.id} · {trade.closeReason === 'stop-loss' ? 'حدضرر' : trade.closeReason === 'take-profit' ? 'حدسود' : 'بستن دستی'}
-                        </div>
-                        <time className="mt-0.5 block text-[10px] text-slate-500">{formatTradeDate(trade.exitTime ?? trade.entryTime)}</time>
-                      </div>
-                      <span className="font-mono text-slate-300">{formatPrice(trade.entryPrice)} ← {formatPrice(trade.exitPrice)}</span>
-                      <span className="font-mono text-sky-300">R:R {tradeRiskReward(trade)}</span>
-                      <strong className={`text-left font-mono ${(trade.realizedProfit ?? 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>{currencyFormatter.format(trade.realizedProfit ?? 0)}</strong>
-                    </div>
-                  ))}
+              {closedTradeHistoryContent}
             </div>
           </div>
         </div>

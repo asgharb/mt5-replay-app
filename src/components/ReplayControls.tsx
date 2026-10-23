@@ -9,29 +9,44 @@ import { Timeframe } from '../types/market';
 import { findCandleIndexByTime } from '../lib/time/binarySearch';
 
 const TF_LIST: Timeframe[] = ['M1', 'M5', 'M15', 'H1', 'H4'];
+const REPLAY_SPEEDS = [10000, 2000, 1000, 500, 200, 100] as const;
 type SymbolFiles = Record<string, Partial<Record<Timeframe, string>>>;
 
+function replayIntervalMs(speedMs: number) {
+  return REPLAY_SPEEDS.includes(speedMs as typeof REPLAY_SPEEDS[number]) ? speedMs : 1000;
+}
+
+function formatReplayInterval(intervalMs: number) {
+  const seconds = intervalMs / 1000;
+  if (seconds >= 60) {
+    const minutes = seconds / 60;
+    return `${Number.isInteger(minutes) ? minutes : minutes.toFixed(1)}m/bar`;
+  }
+  return `${seconds >= 1 ? Number.isInteger(seconds) ? seconds : seconds.toFixed(1) : seconds.toFixed(2)}s/bar`;
+}
+
 export default function ReplayControls() {
-  const {
-    activeSymbol,
-    setActiveSymbol,
-    activeTimeframe,
-    setActiveTimeframe,
-    isPlaying,
-    setIsPlaying,
-    isSelectingReplay,
-    setIsSelectingReplay,
-    speedMs,
-    setSpeedMs,
-    stepForward,
-    stepBackward,
-    setDataset,
-    setCurrentTimeSec,
-    currentTimeSec,
-    datasets
-  } = useReplayStore();
+  const activeSymbol = useReplayStore((state) => state.activeSymbol);
+  const setActiveSymbol = useReplayStore((state) => state.setActiveSymbol);
+  const activeTimeframe = useReplayStore((state) => state.activeTimeframe);
+  const setActiveTimeframe = useReplayStore((state) => state.setActiveTimeframe);
+  const isPlaying = useReplayStore((state) => state.isPlaying);
+  const setIsPlaying = useReplayStore((state) => state.setIsPlaying);
+  const isSelectingReplay = useReplayStore((state) => state.isSelectingReplay);
+  const setIsSelectingReplay = useReplayStore((state) => state.setIsSelectingReplay);
+  const speedMs = useReplayStore((state) => state.speedMs);
+  const setSpeedMs = useReplayStore((state) => state.setSpeedMs);
+  const stepForward = useReplayStore((state) => state.stepForward);
+  const stepBackward = useReplayStore((state) => state.stepBackward);
+  const setDataset = useReplayStore((state) => state.setDataset);
+  const setCurrentTimeSec = useReplayStore((state) => state.setCurrentTimeSec);
+  const currentTimeSec = useReplayStore((state) => state.currentTimeSec);
+  const datasets = useReplayStore((state) => state.datasets);
   const processCandle = useTradingStore((state) => state.processCandle);
-  const { defaultLots, defaultStopLossPoints, defaultTakeProfitPoints, openPosition } = useTradingStore();
+  const defaultLots = useTradingStore((state) => state.defaultLots);
+  const defaultStopLossPoints = useTradingStore((state) => state.defaultStopLossPoints);
+  const defaultTakeProfitPoints = useTradingStore((state) => state.defaultTakeProfitPoints);
+  const openPosition = useTradingStore((state) => state.openPosition);
   const [symbolFiles, setSymbolFiles] = useState<SymbolFiles>({});
   const [availableSymbols, setAvailableSymbols] = useState<string[]>([]);
   const previousTimeRef = useRef<number | null>(null);
@@ -42,8 +57,7 @@ export default function ReplayControls() {
   useEffect(() => {
     let timer: NodeJS.Timeout;
     if (isPlaying) {
-      const timeframeSeconds: Record<Timeframe, number> = { M1: 60, M5: 300, M15: 900, H1: 3600, H4: 14400 };
-      const intervalMs = speedMs === 0 ? timeframeSeconds[activeTimeframe] * 1000 : speedMs;
+      const intervalMs = replayIntervalMs(speedMs);
       timer = setInterval(() => {
         stepForward();
       }, intervalMs);
@@ -205,13 +219,12 @@ export default function ReplayControls() {
           onChange={(e) => setSpeedMs(Number(e.target.value))}
           className="bg-slate-800 border border-slate-700 text-xs rounded p-1.5 ml-2"
         >
-          <option value={10000}>0.1x (10s/bar)</option>
-          <option value={2000}>0.5x (2s)</option>
-          <option value={1000}>1.0x (1s)</option>
-          <option value={500}>2.0x (0.5s)</option>
-          <option value={200}>5.0x (0.2s)</option>
-          <option value={100}>10x (0.1s/bar)</option>
-          <option value={0}>Real time (timeframe)</option>
+          <option value={10000}>0.1x ({formatReplayInterval(replayIntervalMs(10000))})</option>
+          <option value={2000}>0.5x ({formatReplayInterval(replayIntervalMs(2000))})</option>
+          <option value={1000}>1.0x ({formatReplayInterval(replayIntervalMs(1000))})</option>
+          <option value={500}>2.0x ({formatReplayInterval(replayIntervalMs(500))})</option>
+          <option value={200}>5.0x ({formatReplayInterval(replayIntervalMs(200))})</option>
+          <option value={100}>10x ({formatReplayInterval(replayIntervalMs(100))})</option>
         </select>
       </div>
 

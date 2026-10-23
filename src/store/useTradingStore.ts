@@ -15,6 +15,7 @@ interface TradingState {
   pointSize: number;
   commissionPerLot: number;
   trades: Trade[];
+  closedTradesBySymbol: Record<string, Trade[]>;
   pendingOrders: PendingOrder[];
   nextTradeId: number;
   nextPendingOrderId: number;
@@ -107,13 +108,14 @@ export const useTradingStore = create<TradingState>((set, get) => ({
   pointSize: 0.1,
   commissionPerLot: 0,
   trades: [],
+  closedTradesBySymbol: {},
   pendingOrders: [],
   nextTradeId: 1,
   nextPendingOrderId: 1,
 
   resetAccount: (initialCapital) => {
     const capital = Math.max(0, initialCapital);
-    set({ initialCapital: capital, balance: capital, trades: [], pendingOrders: [], nextTradeId: 1, nextPendingOrderId: 1 });
+    set({ initialCapital: capital, balance: capital, trades: [], closedTradesBySymbol: {}, pendingOrders: [], nextTradeId: 1, nextPendingOrderId: 1 });
   },
   setDefaultLots: (defaultLots) => set({ defaultLots }),
   setDefaultStopLossPoints: (defaultStopLossPoints) => set({ defaultStopLossPoints }),
@@ -187,6 +189,7 @@ export const useTradingStore = create<TradingState>((set, get) => ({
   })),
 
   closePosition: (id, candle, time) => set((state) => {
+    if (!state.trades.some((trade) => trade.id === id && trade.status === 'open')) return state;
     let balance = state.balance;
     const trades = state.trades.map((trade) => {
       if (trade.id !== id || trade.status !== 'open') return trade;
@@ -196,12 +199,32 @@ export const useTradingStore = create<TradingState>((set, get) => ({
       balance += (closed.grossProfit ?? 0) - trade.commissionPerLot * trade.lots;
       return closed;
     });
-    return { trades, balance };
+    const closedTrade = trades.find((trade) => trade.id === id && trade.status === 'closed');
+    if (!closedTrade) return { trades, balance };
+    const symbolKey = (closedTrade.symbol ?? 'DJIUSD').toLowerCase();
+    return {
+      trades,
+      balance,
+      closedTradesBySymbol: {
+        ...state.closedTradesBySymbol,
+        [symbolKey]: [...(state.closedTradesBySymbol[symbolKey] ?? []), closedTrade]
+          .sort((a, b) => (b.exitTime ?? b.entryTime) - (a.exitTime ?? a.entryTime)),
+      },
+    };
   }),
 
   processCandle: (candle, time, symbol = 'DJIUSD') => set((state) => {
+    const normalizedSymbol = symbol.toLowerCase();
+    const hasTradeToProcess = state.trades.some((trade) => trade.status === 'open'
+      && (trade.symbol ?? 'DJIUSD').toLowerCase() === normalizedSymbol
+      && time > trade.entryTime && time > trade.lastProcessedTime);
+    const hasOrderToProcess = state.pendingOrders.some((order) =>
+      (order.symbol ?? 'DJIUSD').toLowerCase() === normalizedSymbol && time > order.placedTime);
+    if (!hasTradeToProcess && !hasOrderToProcess) return state;
+
     let balance = state.balance;
     let nextTradeId = state.nextTradeId;
+    const newlyClosedTrades: Trade[] = [];
     const trades = state.trades.map((trade) => {
       if (trade.status !== 'open' || (trade.symbol ?? 'DJIUSD').toLowerCase() !== symbol.toLowerCase()
         || time <= trade.entryTime || time <= trade.lastProcessedTime) return trade;
@@ -237,6 +260,7 @@ export const useTradingStore = create<TradingState>((set, get) => ({
 
       if (reason) {
         const closed = finishTrade(trade, candle, time, exitPrice, reason);
+        newlyClosedTrades.push(closed);
         balance += (closed.grossProfit ?? 0) - trade.commissionPerLot * trade.lots;
         return closed;
       }
@@ -288,6 +312,14 @@ export const useTradingStore = create<TradingState>((set, get) => ({
       nextTradeId += 1;
     }
 
-    return { trades, balance, pendingOrders: remainingOrders, nextTradeId };
+    const closedTradesBySymbol = newlyClosedTrades.length === 0 ? state.closedTradesBySymbol : { ...state.closedTradesBySymbol };
+    for (const trade of newlyClosedTrades) {
+      const symbolKey = (trade.symbol ?? 'DJIUSD').toLowerCase();
+      closedTradesBySymbol[symbolKey] = [...(closedTradesBySymbol[symbolKey] ?? []), trade];
+    }
+    for (const symbolKey of new Set(newlyClosedTrades.map((trade) => (trade.symbol ?? 'DJIUSD').toLowerCase()))) {
+      closedTradesBySymbol[symbolKey].sort((a, b) => (b.exitTime ?? b.entryTime) - (a.exitTime ?? a.entryTime));
+    }
+    return { trades, balance, pendingOrders: remainingOrders, nextTradeId, closedTradesBySymbol };
   }),
 }));
