@@ -12,7 +12,9 @@ export function parseCsvCandles(csvContent: string): Candle[] {
   const candles: Candle[] = [];
 
   for (const row of result.data) {
-    const rawTime = row['time'] ?? row['<TIME>'] ?? row['Time'] ?? row['timestamp'];
+    const rawDate = row['date'] ?? row['<DATE>'] ?? row['Date'];
+    const rawClock = row['<TIME>'] ?? row['Time'] ?? row['time'];
+    const rawTime = row['timestamp'] ?? row['time'] ?? row['<TIME>'] ?? row['Time'];
     const open = Number(row['open'] ?? row['<OPEN>'] ?? row['Open']);
     const high = Number(row['high'] ?? row['<HIGH>'] ?? row['High']);
     const low = Number(row['low'] ?? row['<LOW>'] ?? row['Low']);
@@ -24,9 +26,18 @@ export function parseCsvCandles(csvContent: string): Candle[] {
       continue;
     }
 
-    let timeMs = Number(rawTime);
-    if (isNaN(timeMs)) {
-      timeMs = new Date(String(rawTime).replace(/\./g, '-')).getTime();
+    let timeMs: number;
+    if (rawDate !== undefined && rawClock !== undefined) {
+      const [year, month, day] = String(rawDate).trim().split(/[.\-/]/).map(Number);
+      const [hour = 0, minute = 0, second = 0] = String(rawClock).trim().split(':').map(Number);
+      timeMs = [year, month, day, hour, minute, second].every(Number.isFinite)
+        ? Date.UTC(year, month - 1, day, hour, minute, second)
+        : Number.NaN;
+    } else {
+      timeMs = Number(rawTime);
+      if (isNaN(timeMs)) {
+        timeMs = new Date(String(rawTime).replace(/\./g, '-')).getTime();
+      }
     }
 
     if (isNaN(timeMs)) continue;
